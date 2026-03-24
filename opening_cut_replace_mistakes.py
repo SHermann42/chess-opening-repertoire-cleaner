@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 #
+# Version 0.1.1
 # Datei: opening_cut_replace_mistakes.py
-# Zweck: Schneidet PGN-Partien am ersten Fehler einer gewählten Farbe ab und ersetzt den fehlerhaften Zug durch den besten Stockfish-Zug.
+# Zweck: Schneidet PGN-Partien am ersten Fehler einer gewählten Farbe ab
+#         und ersetzt den fehlerhaften Zug durch den besten Stockfish-Zug.
 # Autor: Dr. Sven Hermann
 # Lizenz: GNU GPL v3
 # Copyright (C) 2026 Sven Hermann
@@ -28,11 +30,12 @@ Definition "Fehler":
     Es gibt einen alternativen legalen Zug, den Stockfish mindestens
     threshold_cp Centipawns besser bewertet als den tatsächlich gespielten Zug.
 
-Features:
-    - Analyse nur für eine gewählte Farbe (--color white|black)
-    - Fehlersuche beginnt erst ab Zug X dieser Farbe (--start-move)
-    - Optionales Stoppen nach max_ply Halbzügen
-    - Fortschrittsanzeige mit tqdm
+Wichtige Erweiterungen in dieser Fassung:
+    - harter Timeout für die UCI-Engine
+    - optionaler Engine-Neustart nach N Partien
+    - Debug-Ausgaben für laufende Partie / Ply
+    - robustere Fehlerbehandlung bei Engine-Problemen
+    - Fortschritt wirkt nicht mehr "eingefroren", weil laufende Partie sichtbar wird
 """
 
 from __future__ import annotations
@@ -79,6 +82,38 @@ def score_to_cp(info: dict, pov: chess.Color) -> int:
     if cp is None:
         raise ValueError("Engine lieferte keine verwertbare Bewertung.")
     return cp
+
+
+def safe_stderr(msg: str) -> None:
+    print(msg, file=sys.stderr, flush=True)
+
+
+def start_engine(
+    engine_path: str,
+    engine_timeout: float,
+    hash_mb: Optional[int],
+    threads: Optional[int],
+) -> chess.engine.SimpleEngine:
+    engine = chess.engine.SimpleEngine.popen_uci(engine_path, timeout=engine_timeout)
+
+    config = {}
+    if hash_mb is not None:
+        config["Hash"] = hash_mb
+    if threads is not None:
+        config["Threads"] = threads
+    if config:
+        engine.configure(config)
+
+    return engine
+
+
+def stop_engine(engine: Optional[chess.engine.SimpleEngine]) -> None:
+    if engine is None:
+        return
+    try:
+        engine.quit()
+    except Exception:
+        pass
 
 
 def analyse_best_move(
@@ -131,6 +166,9 @@ def find_first_mistake(
     analyze_color: chess.Color,
     max_ply: Optional[int] = None,
     start_move: int = 1,
+    game_number: Optional[int] = None,
+    debug_progress: bool = False,
+    debug_every_ply: int = 20,
 ) -> Optional[MistakeInfo]:
     board = game.board()
     mainline_moves = list(game.mainline_moves())
@@ -141,6 +179,14 @@ def find_first_mistake(
             break
 
         if board.turn == analyze_color and ply_index >= start_ply:
+            if debug_progress and debug_every_ply > 0 and ply_index % debug_every_ply == 0:
+                if game_number is not None:
+                    safe_stderr(
+                        f"[DEBUG] Partie {game_number}: Analyse läuft bei ply {ply_index + 1}"
+                    )
+                else:
+                    safe_stderr(f"[DEBUG] Analyse läuft bei ply {ply_index + 1}")
+
             best_move, best_score_cp = analyse_best_move(engine, board, limit)
             played_score_cp = analyse_forced_move(engine, board, move, limit)
             delta_cp = best_score_cp - played_score_cp
@@ -179,7 +225,6 @@ def rebuild_game_with_replacement(
 
     moves = list(original_game.mainline_moves())
     node = new_game
-
     board = original_game.board()
 
     for move in moves[:mistake.ply_index]:
@@ -202,6 +247,7 @@ def rebuild_game_with_replacement(
         )
 
     return new_game
+
 
 def count_games_in_pgn(input_path: str) -> int:
     count = 0
@@ -230,12 +276,25 @@ def process_pgn(
     hash_mb: Optional[int],
     threads: Optional[int],
     show_progress: bool,
+    engine_timeout: float,
+    restart_engine_every: int,
+    debug_progress: bool,
+    debug_every_ply: int,
 ) -> None:
     if sum(x is not None for x in (depth, movetime_ms, nodes)) != 1:
         raise ValueError("Genau eine von --depth, --movetime-ms oder --nodes angeben.")
 
     if start_move < 1:
         raise ValueError("--start-move muss >= 1 sein.")
+
+    if engine_timeout <= 0:
+        raise ValueError("--engine-timeout muss > 0 sein.")
+
+    if restart_engine_every < 0:
+        raise ValueError("--restart-engine-every muss >= 0 sein.")
+
+    if debug_every_ply < 1:
+        raise ValueError("--debug-every-ply muss >= 1 sein.")
 
     if depth is not None:
         limit = chess.engine.Limit(depth=depth)
@@ -249,17 +308,15 @@ def process_pgn(
     failed_games = 0
 
     total_count = count_games_in_pgn(input_path) if show_progress else None
-
-    engine = chess.engine.SimpleEngine.popen_uci(engine_path)
+    engine: Optional[chess.engine.SimpleEngine] = None
 
     try:
-        config = {}
-        if hash_mb is not None:
-            config["Hash"] = hash_mb
-        if threads is not None:
-            config["Threads"] = threads
-        if config:
-            engine.configure(config)
+        engine = start_engine(
+            engine_path=engine_path,
+            engine_timeout=engine_timeout,
+            hash_mb=hash_mb,
+            threads=threads,
+        )
 
         with open(input_path, "r", encoding="utf-8", errors="replace") as pgn_in, \
              open(output_path, "w", encoding="utf-8", newline="\n") as pgn_out:
@@ -280,7 +337,25 @@ def process_pgn(
 
                     total_games += 1
 
+                    if debug_progress:
+                        safe_stderr(f"[INFO] Starte Partie {total_games}")
+
+                    if restart_engine_every > 0 and total_games > 1 and (total_games - 1) % restart_engine_every == 0:
+                        if debug_progress:
+                            safe_stderr(
+                                f"[INFO] Engine-Neustart vor Partie {total_games} "
+                                f"(Intervall {restart_engine_every})"
+                            )
+                        stop_engine(engine)
+                        engine = start_engine(
+                            engine_path=engine_path,
+                            engine_timeout=engine_timeout,
+                            hash_mb=hash_mb,
+                            threads=threads,
+                        )
+
                     try:
+                        assert engine is not None
                         mistake = find_first_mistake(
                             game=game,
                             engine=engine,
@@ -289,13 +364,55 @@ def process_pgn(
                             analyze_color=analyze_color,
                             max_ply=max_ply,
                             start_move=start_move,
+                            game_number=total_games,
+                            debug_progress=debug_progress,
+                            debug_every_ply=debug_every_ply,
                         )
+                    except (
+                        TimeoutError,
+                        BrokenPipeError,
+                        EOFError,
+                        chess.engine.EngineError,
+                        chess.engine.EngineTerminatedError,
+                        ValueError,
+                        RuntimeError,
+                    ) as exc:
+                        failed_games += 1
+                        safe_stderr(
+                            f"[WARN] Partie {total_games}: Analyse fehlgeschlagen: {exc}"
+                        )
+
+                        stop_engine(engine)
+                        try:
+                            engine = start_engine(
+                                engine_path=engine_path,
+                                engine_timeout=engine_timeout,
+                                hash_mb=hash_mb,
+                                threads=threads,
+                            )
+                            safe_stderr("[INFO] Engine wurde neu gestartet.")
+                        except Exception as restart_exc:
+                            safe_stderr(
+                                f"[WARN] Engine-Neustart fehlgeschlagen: {restart_exc}"
+                            )
+                            engine = None
+
+                        if keep_unmodified:
+                            print(game, file=pgn_out, end="\n\n")
+
+                        if show_progress:
+                            progress.update(1)
+                            progress.set_postfix(
+                                geändert=changed_games,
+                                fehler=failed_games,
+                            )
+                        continue
                     except Exception as exc:
                         failed_games += 1
-                        print(
-                            f"[WARN] Partie {total_games}: Analyse fehlgeschlagen: {exc}",
-                            file=sys.stderr,
+                        safe_stderr(
+                            f"[WARN] Partie {total_games}: Unerwarteter Fehler: {exc}"
                         )
+
                         if keep_unmodified:
                             print(game, file=pgn_out, end="\n\n")
 
@@ -329,13 +446,18 @@ def process_pgn(
                 progress.close()
 
     finally:
-        engine.quit()
+        stop_engine(engine)
 
     print(f"Partien gesamt:      {total_games}")
     print(f"Partien modifiziert: {changed_games}")
     print(f"Partien mit Fehler:  {failed_games}")
     print(f"Analysierte Farbe:   {color_name_de(analyze_color)}")
     print(f"Fehlersuche ab:      Zug {start_move} dieser Farbe")
+    print(f"Engine-Timeout:      {engine_timeout:.1f}s")
+    if restart_engine_every > 0:
+        print(f"Engine-Neustart:     alle {restart_engine_every} Partien")
+    else:
+        print("Engine-Neustart:     deaktiviert")
     if keep_unmodified:
         print("Ausgabe enthält:     alle Partien")
     else:
@@ -410,6 +532,29 @@ def build_arg_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Fortschrittsanzeige deaktivieren",
     )
+    parser.add_argument(
+        "--engine-timeout",
+        type=float,
+        default=15.0,
+        help="Harter UCI-Timeout für die Engine in Sekunden, Standard: 15.0",
+    )
+    parser.add_argument(
+        "--restart-engine-every",
+        type=int,
+        default=100,
+        help="Engine nach jeweils N Partien neu starten, 0 = deaktiviert, Standard: 100",
+    )
+    parser.add_argument(
+        "--debug-progress",
+        action="store_true",
+        help="Zusätzliche Debug-Ausgaben zu aktueller Partie / Ply auf stderr",
+    )
+    parser.add_argument(
+        "--debug-every-ply",
+        type=int,
+        default=20,
+        help="Bei Debug: Meldung alle N analysierten Halbzüge, Standard: 20",
+    )
 
     return parser
 
@@ -437,6 +582,10 @@ def main() -> None:
             hash_mb=args.hash_mb,
             threads=args.threads,
             show_progress=not args.no_progress,
+            engine_timeout=args.engine_timeout,
+            restart_engine_every=args.restart_engine_every,
+            debug_progress=args.debug_progress,
+            debug_every_ply=args.debug_every_ply,
         )
     except Exception as exc:
         print(f"FEHLER: {exc}", file=sys.stderr)
