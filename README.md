@@ -1,4 +1,3 @@
-````markdown
 # opening-cut-replace-mistakes
 
 Python-Skript zum Analysieren von PGN-Partien mit Stockfish.
