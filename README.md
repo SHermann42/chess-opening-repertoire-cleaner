@@ -38,8 +38,8 @@ Ein Zug gilt als Fehler, wenn es einen alternativen legalen Zug gibt, den Stockf
 ### 1. Repository klonen
 
 ```bash
-git clone https://github.com/SHermann42/opening-cut-replace-mistakes.git
-cd opening-cut-replace-mistakes
+git clone https://github.com/SHermann42/chess-opening-repertoire-cleaner.git
+cd chess-opening-repertoire-cleaner
 ````
 
 ### 2. Virtuelle Umgebung anlegen
